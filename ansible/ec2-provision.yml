@@ -1,0 +1,183 @@
+---
+- name: Provision EC2 Instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # AWS Configuration
+    aws_region: "{{ aws_region | default('us-east-1') }}"
+    key_name: "{{ key_name | default('my-key-pair') }}"
+    
+    # Instance Configuration
+    instance_type: "{{ instance_type | default('t3.micro') }}"
+    ami_id: "{{ ami_id | default('ami-0c02fb55956c7d316') }}"  # Amazon Linux 2 AMI
+    instance_count: "{{ instance_count | default(1) }}"
+    
+    # Network Configuration
+    vpc_id: "{{ vpc_id | default('') }}"
+    subnet_id: "{{ subnet_id | default('') }}"
+    
+    # Security Group Configuration
+    security_group_name: "{{ security_group_name | default('web-server-sg') }}"
+    
+    # Tags
+    environment: "{{ environment | default('development') }}"
+    project_name: "{{ project_name | default('train-schedule-app') }}"
+    
+  tasks:
+    - name: Create Security Group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: Security group for web servers
+        region: "{{ aws_region }}"
+        vpc_id: "{{ vpc_id if vpc_id else omit }}"
+        rules:
+          - proto: tcp
+            ports:
+              - 22
+            cidr_ip: 0.0.0.0/0
+            rule_desc: SSH access
+          - proto: tcp
+            ports:
+              - 80
+            cidr_ip: 0.0.0.0/0
+            rule_desc: HTTP access
+          - proto: tcp
+            ports:
+              - 443
+            cidr_ip: 0.0.0.0/0
+            rule_desc: HTTPS access
+          - proto: tcp
+            ports:
+              - 3000
+            cidr_ip: 0.0.0.0/0
+            rule_desc: Node.js app access
+        tags:
+          Name: "{{ security_group_name }}"
+          Environment: "{{ environment }}"
+          Project: "{{ project_name }}"
+      register: security_group
+
+    - name: Launch EC2 instances
+      amazon.aws.ec2_instance:
+        name: "{{ project_name }}-{{ environment }}-{{ item }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        region: "{{ aws_region }}"
+        vpc_subnet_id: "{{ subnet_id if subnet_id else omit }}"
+        security_groups:
+          - "{{ security_group.group_id }}"
+        state: present
+        wait: true
+        wait_timeout: 300
+        tags:
+          Name: "{{ project_name }}-{{ environment }}-{{ item }}"
+          Environment: "{{ environment }}"
+          Project: "{{ project_name }}"
+          Type: web-server
+        user_data: |
+          #!/bin/bash
+          yum update -y
+          yum install -y git nodejs npm java-11-openjdk-devel
+          
+          # Create application user
+          useradd -m -s /bin/bash appuser
+          
+          # Clone application (replace with your repo URL)
+          cd /home/appuser
+          git clone https://github.com/your-repo/cicd-pipeline-train-schedule-jenkins.git app
+          chown -R appuser:appuser /home/appuser/app
+          
+          # Setup application
+          cd /home/appuser/app
+          sudo -u appuser ./gradlew build
+          
+          # Create systemd service
+          cat > /etc/systemd/system/train-schedule.service << EOF
+          [Unit]
+          Description=Train Schedule App
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=appuser
+          WorkingDirectory=/home/appuser/app
+          ExecStart=/home/appuser/app/gradlew npm_start
+          Restart=always
+          
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          
+          systemctl daemon-reload
+          systemctl enable train-schedule
+          systemctl start train-schedule
+      loop: "{{ range(1, instance_count + 1) | list }}"
+      register: ec2_instances
+
+    - name: Wait for instances to be reachable
+      wait_for:
+        host: "{{ item.public_ip_address }}"
+        port: 22
+        delay: 60
+        timeout: 320
+        state: started
+      loop: "{{ ec2_instances.results }}"
+      when: item.public_ip_address is defined
+
+    - name: Add instances to inventory
+      add_host:
+        name: "{{ item.public_ip_address }}"
+        groups: web_servers
+        ansible_host: "{{ item.public_ip_address }}"
+        ansible_user: ec2-user
+        ansible_ssh_private_key_file: "~/.ssh/{{ key_name }}.pem"
+      loop: "{{ ec2_instances.results }}"
+      when: item.public_ip_address is defined
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Instance Name: {{ item.tags.Name }}"
+          - "Instance ID: {{ item.instance_id }}"
+          - "Public IP: {{ item.public_ip_address | default('N/A') }}"
+          - "Private IP: {{ item.private_ip_address }}"
+          - "State: {{ item.state.name }}"
+      loop: "{{ ec2_instances.results }}"
+
+- name: Configure EC2 Instances
+  hosts: web_servers
+  become: yes
+  gather_facts: yes
+  vars:
+    app_port: 3000
+    
+  tasks:
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        delay: 30
+        timeout: 300
+
+    - name: Ensure firewall allows application port
+      firewalld:
+        port: "{{ app_port }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      ignore_errors: yes  # firewalld might not be installed
+
+    - name: Check if application is running
+      uri:
+        url: "http://localhost:{{ app_port }}"
+        method: GET
+        status_code: 200
+      register: app_status
+      retries: 10
+      delay: 30
+      until: app_status.status == 200
+      ignore_errors: yes
+
+    - name: Display application status
+      debug:
+        msg: "Application is {{ 'running' if app_status.status == 200 else 'not running' }}"

@@ -1,0 +1,69 @@
+---
+- name: Terminate EC2 Instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    aws_region: "{{ aws_region | default('us-east-1') }}"
+    environment: "{{ environment | default('development') }}"
+    project_name: "{{ project_name | default('train-schedule-app') }}"
+    
+  tasks:
+    - name: Get EC2 instance information
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Project": "{{ project_name }}"
+          "tag:Environment": "{{ environment }}"
+          "instance-state-name": ["running", "stopped"]
+      register: ec2_info
+
+    - name: Display instances to be terminated
+      debug:
+        msg:
+          - "Instance ID: {{ item.instance_id }}"
+          - "Name: {{ item.tags.Name | default('N/A') }}"
+          - "State: {{ item.state.name }}"
+          - "Public IP: {{ item.public_ip_address | default('N/A') }}"
+      loop: "{{ ec2_info.instances }}"
+      when: ec2_info.instances | length > 0
+
+    - name: Confirm termination
+      pause:
+        prompt: "Are you sure you want to terminate {{ ec2_info.instances | length }} instance(s)? (yes/no)"
+      register: confirm_termination
+      when: ec2_info.instances | length > 0
+
+    - name: Terminate EC2 instances
+      amazon.aws.ec2_instance:
+        instance_ids: "{{ item.instance_id }}"
+        region: "{{ aws_region }}"
+        state: terminated
+        wait: true
+        wait_timeout: 300
+      loop: "{{ ec2_info.instances }}"
+      when: 
+        - ec2_info.instances | length > 0
+        - confirm_termination.user_input | lower == 'yes'
+
+    - name: Delete Security Group
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name | default('web-server-sg') }}"
+        region: "{{ aws_region }}"
+        state: absent
+      when: 
+        - ec2_info.instances | length > 0
+        - confirm_termination.user_input | lower == 'yes'
+      ignore_errors: yes  # Security group might be in use
+
+    - name: Termination complete
+      debug:
+        msg: "All instances have been terminated successfully"
+      when: 
+        - ec2_info.instances | length > 0
+        - confirm_termination.user_input | lower == 'yes'
+
+    - name: No instances found
+      debug:
+        msg: "No instances found matching the criteria"
+      when: ec2_info.instances | length == 0
